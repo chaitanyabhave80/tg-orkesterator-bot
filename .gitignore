@@ -38,3 +38,4 @@ vault/*
 Thumbs.db
 *.swp
 .gh_token
+push.sh
