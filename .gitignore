@@ -37,3 +37,4 @@ vault/*
 .DS_Store
 Thumbs.db
 *.swp
+.gh_token
