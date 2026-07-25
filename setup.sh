@@ -1,7 +1,8 @@
+```bash
 #!/bin/bash
 set -e
 
-echo "🚀 Initializing Orchestrator Environment..."
+echo "🚀 Initializing Orchestrator Environment...  devloped by chaitanyabhave80"
 
 # Pre-flight Check: Ensure Docker is installed
 if ! command -v docker &>/dev/null; then
@@ -61,6 +62,7 @@ import zipfile
 import logging
 import docker
 import time
+import asyncio
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -98,14 +100,13 @@ STAGING_DIR = os.path.abspath("./staging")
 VAULT_DIR = os.path.abspath("./vault")
 TEMPLATES_DIR = os.path.abspath("./templates")
 
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB limit to prevent disk exhaustion
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB limit
 user_last_deploy = {}              # In-memory rate limiting state
 
 # Initialize Docker Client
 docker_client = docker.from_env()
 
 def is_authorized(user_id: int) -> bool:
-    """Checks if the user ID is in the explicit whitelist."""
     return user_id in ALLOWED_USER_IDS
 
 def safe_extract_zip(zip_file_path: str, extract_to_dir: str):
@@ -145,7 +146,6 @@ async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     document = update.message.document
 
-    # Validate file size (100MB max)
     if document.file_size > MAX_FILE_SIZE:
         logging.warning(f"User {user_id} attempted to upload a file exceeding limit: {document.file_size} bytes")
         await update.message.reply_text(
@@ -158,6 +158,7 @@ async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_staging = os.path.join(STAGING_DIR, str_user_id)
 
     # Clean existing workspace to ensure fresh deployment context
+    shutil.rmtree(user_staging, ignore_errors=True)
     os.makedirs(user_staging, exist_ok=True)
 
     file_path = os.path.join(user_staging, document.file_name)
@@ -166,10 +167,10 @@ async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logging.info(f"User {user_id} uploaded file '{document.file_name}' ({document.file_size} bytes)")
 
-    # Safely extract ZIP packages
+    # Safely extract ZIP packages (Offloaded to worker thread)
     if document.file_name.endswith('.zip'):
         try:
-            safe_extract_zip(file_path, user_staging)
+            await asyncio.to_thread(safe_extract_zip, file_path, user_staging)
         except Exception as e:
             logging.error(f"ZIP extraction failed for user {user_id}: {str(e)}")
             shutil.rmtree(user_staging, ignore_errors=True)
@@ -178,13 +179,18 @@ async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             if os.path.exists(file_path):
                 os.remove(file_path)
+    
+    # Auto-rename single JS uploads so the Dockerfile CMD ["node", "index.js"] works
+    elif document.file_name.endswith('.js') and document.file_name != 'index.js':
+        target_path = os.path.join(user_staging, "index.js")
+        os.rename(file_path, target_path)
 
     # ALWAYS force overwrite with hardened Dockerfile template
     dockerfile_target = os.path.join(user_staging, "Dockerfile")
     shutil.copy(os.path.join(TEMPLATES_DIR, "Dockerfile.template"), dockerfile_target)
 
     await update.message.reply_text(
-        f"📦 *Code Ingested Safely*\nStaging workspace ready for Telegram ID `{user_id}`.\nRun /deploy to run the container.",
+        f"📦 *Code Ingested Safely*\nStaging workspace ready for Telegram ID `{user_id}`.\nRun /deploy to start the container.",
         parse_mode="Markdown"
     )
 
@@ -197,7 +203,7 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     str_user_id = str(user_id)
     
-    # Rate Limiter: 5 seconds between deployments per user
+    # Rate Limiter: 5 seconds between deployments
     current_time = time.time()
     if str_user_id in user_last_deploy:
         if current_time - user_last_deploy[str_user_id] < 5:
@@ -207,6 +213,7 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_staging = os.path.join(STAGING_DIR, str_user_id)
     container_name = f"dalker_user_{str_user_id}"
+    network_name = f"dalker_net_{str_user_id}"
 
     if not os.path.exists(user_staging):
         await update.message.reply_text("❌ No code package found. Please upload a `.zip` or `.js` file first.")
@@ -220,29 +227,33 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("⚙️ Building hardened container...")
+    await update.message.reply_text("⚙️ Building hardened container... This may take a moment.")
 
     try:
-        # Cleanup existing running container instance if present
+        # Cleanup existing running container instance (Offloaded)
         try:
-            old = docker_client.containers.get(container_name)
-            old.stop()
-            old.remove()
+            old = await asyncio.to_thread(docker_client.containers.get, container_name)
+            await asyncio.to_thread(old.stop)
+            await asyncio.to_thread(old.remove)
         except docker.errors.NotFound:
             pass
 
-        # Build isolated image
-        image, _ = docker_client.images.build(path=user_staging, tag=f"dalker_img_{str_user_id}")
+        # Build isolated image (Offloaded to prevent blocking Event Loop)
+        image, _ = await asyncio.to_thread(
+            docker_client.images.build,
+            path=user_staging,
+            tag=f"dalker_img_{str_user_id}"
+        )
 
         # Enforce private container bridge network per user
-        network_name = f"dalker_net_{str_user_id}"
         try:
-            docker_client.networks.get(network_name)
+            await asyncio.to_thread(docker_client.networks.get, network_name)
         except docker.errors.NotFound:
-            docker_client.networks.create(network_name, driver="bridge")
+            await asyncio.to_thread(docker_client.networks.create, network_name, driver="bridge")
 
-        # Deploy container with quotas
-        container = docker_client.containers.run(
+        # Deploy container with quotas (Offloaded)
+        container = await asyncio.to_thread(
+            docker_client.containers.run,
             image.id,
             name=container_name,
             detach=True,
@@ -268,7 +279,7 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Build failed. Check your Node.js code/dependencies for syntax errors.", parse_mode="Markdown")
     except docker.errors.DockerException as e:
         logging.error(f"Docker engine error during deploy for user {user_id}: {str(e)}")
-        await update.message.reply_text("❌ Container engine error. Please notify the administrator.", parse_mode="Markdown")
+        await update.message.reply_text("❌ Container engine error. Check daemon or permissions.", parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Unexpected error during deploy for user {user_id}: {str(e)}")
         await update.message.reply_text("❌ Deployment failed due to an unexpected error.", parse_mode="Markdown")
@@ -284,7 +295,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     container_name = f"dalker_user_{str_user_id}"
 
     try:
-        container = docker_client.containers.get(container_name)
+        container = await asyncio.to_thread(docker_client.containers.get, container_name)
         status_msg = (
             f"🟢 *Container Active*\n\n"
             f"• *Name:* `{container.name}`\n"
@@ -306,16 +317,15 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     container_name = f"dalker_user_{str_user_id}"
 
     try:
-        container = docker_client.containers.get(container_name)
-        container.stop()
-        container.remove()
+        container = await asyncio.to_thread(docker_client.containers.get, container_name)
+        await asyncio.to_thread(container.stop)
+        await asyncio.to_thread(container.remove)
         logging.info(f"Container '{container_name}' stopped and removed by user {user_id}")
         await update.message.reply_text("🛑 Active container stopped and purged.")
     except docker.errors.NotFound:
         await update.message.reply_text("⚠️ No running instance found to stop.")
 
 async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin utility to sweep orphaned images and networks."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         logging.warning(f"Unauthorized /cleanup attempt from user ID: {user_id}")
@@ -324,8 +334,8 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🧹 Sweeping orphaned Docker resources...")
     try:
-        pruned_images = docker_client.images.prune(filters={"dangling": True})
-        docker_client.networks.prune()
+        pruned_images = await asyncio.to_thread(docker_client.images.prune, filters={"dangling": True})
+        await asyncio.to_thread(docker_client.networks.prune)
         
         reclaimed_space = pruned_images.get('SpaceReclaimed', 0) / (1024 * 1024)
         logging.info(f"User {user_id} triggered cleanup. Reclaimed {reclaimed_space:.1f} MB.")
@@ -366,3 +376,5 @@ fi
 echo -e "\n✨ Setup complete! Make sure the Docker daemon is running."
 echo "👉 To start the bot, run:"
 echo "cd tg-orkesterator-bot && source venv/bin/activate && python src/bot.py"
+
+```
