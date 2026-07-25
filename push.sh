@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 GH_USER="chaitanyabhave80"
 GH_EMAIL="chaitanyabhave80@gmail.com"
@@ -8,16 +9,19 @@ REPO="github.com/chaitanyabhave80/tg-orkesterator-bot.git"
 git config user.name "$GH_USER"
 git config user.email "$GH_EMAIL"
 
-# If token isn't saved yet, ask for it once
+# If token isn't saved yet, ask for it once securely
 if [ ! -f .gh_token ]; then
     echo "=========================================="
-    echo "PASTE YOUR GITHUB TOKEN BELOW AND PRESS ENTER:"
+    echo "PASTE YOUR GITHUB TOKEN BELOW (HIDDEN INPUT):"
     echo "=========================================="
-    read TOKEN
+    read -r -s TOKEN
+    echo ""
     echo "$TOKEN" | tr -d ' \t\n\r' > .gh_token
+    chmod 600 .gh_token
     
-    # Keep token safe from public Git uploads
+    # Keep token & script safe from public Git uploads
     grep -qxF '.gh_token' .gitignore 2>/dev/null || echo '.gh_token' >> .gitignore
+    grep -qxF 'push.sh' .gitignore 2>/dev/null || echo 'push.sh' >> .gitignore
 fi
 
 # Load saved token

@@ -3,24 +3,33 @@ set -e
 
 echo "🚀 Initializing Orchestrator Environment..."
 
-# 1. Create directory hierarchy with new name
+# Pre-flight Check: Ensure Docker is installed
+if ! command -v docker &>/dev/null; then
+    echo "⚠️ Docker is not installed. Please install Docker before running the bot."
+    exit 1
+fi
+
+# 1. Create directory hierarchy
 mkdir -p tg-orkesterator-bot/{src,staging,vault,templates}
 cd tg-orkesterator-bot
 
-# 2. Prompt for API Key and create environment variable configuration
+# 2. Prompt for config and create environment variable configuration
 echo -e "\n🔑 Please enter your Telegram Bot Token:"
 read -r -s TELEGRAM_BOT_TOKEN
 echo -e "\n✅ Token captured securely."
 
-# Notice the unquoted EOF here so the bash variable expands into the file
+echo -e "\n👤 Please enter your allowed Telegram User ID(s) (comma-separated, e.g., 123456789):"
+read -r ALLOWED_USER_IDS
+echo -e "✅ User IDs captured."
+
 cat << EOF > .env
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 MAX_MEMORY_LIMIT=256m
 CPU_QUOTA_MICROSECONDS=50000
+ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
 EOF
 
 # 3. Define project dependencies
-# Using quoted 'EOF' for the rest so internal syntax isn't modified by Bash
 cat << 'EOF' > requirements.txt
 python-telegram-bot>=20.0
 docker>=6.0.0
@@ -44,13 +53,14 @@ USER dalkeruser
 CMD ["node", "index.js"]
 EOF
 
-# 5. Generate core Python Orchestrator logic
+# 5. Generate secure Python Orchestrator logic
 cat << 'EOF' > src/bot.py
 import os
 import shutil
 import zipfile
 import logging
 import docker
+import time
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -64,65 +74,150 @@ from telegram.ext import (
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-STAGING_DIR = os.path.abspath("./staging")
-VAULT_DIR = os.path.abspath("./vault")
-TEMPLATES_DIR = os.path.abspath("./templates")
 
-# Initialize Docker Client
-docker_client = docker.from_env()
-
+# Setup Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
+# Fail fast at startup if ALLOWED_USER_IDS is missing or invalid
+ALLOWED_USER_IDS = [
+    int(uid.strip()) 
+    for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") 
+    if uid.strip().isdigit()
+]
+
+if not ALLOWED_USER_IDS:
+    raise ValueError(
+        "CRITICAL: ALLOWED_USER_IDS is missing or invalid in .env! "
+        "Provide comma-separated Telegram user IDs (e.g., ALLOWED_USER_IDS=123456789)."
+    )
+
+STAGING_DIR = os.path.abspath("./staging")
+VAULT_DIR = os.path.abspath("./vault")
+TEMPLATES_DIR = os.path.abspath("./templates")
+
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB limit to prevent disk exhaustion
+user_last_deploy = {}              # In-memory rate limiting state
+
+# Initialize Docker Client
+docker_client = docker.from_env()
+
+def is_authorized(user_id: int) -> bool:
+    """Checks if the user ID is in the explicit whitelist."""
+    return user_id in ALLOWED_USER_IDS
+
+def safe_extract_zip(zip_file_path: str, extract_to_dir: str):
+    """Prevents Zip Slip (path traversal) vulnerabilities during extraction."""
+    target_dir = os.path.abspath(extract_to_dir)
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        for member in zip_ref.infolist():
+            member_path = os.path.abspath(os.path.join(target_dir, member.filename))
+            if not member_path.startswith(target_dir + os.sep):
+                raise ValueError(f"Security Alert: Path Traversal detected in file: {member.filename}")
+        zip_ref.extractall(target_dir)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logging.warning(f"Unauthorized /start attempt from user ID: {user_id}")
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
     welcome_text = (
         "🛡️ *Orchestrator Online*\n\n"
         "*Usage Rules:*\n"
         "1. Send a `.zip` or `.js` file to stage your deployment.\n"
-        "2. Run /deploy to build and provision your container.\n"
-        "3. Run /status to check resource usage and health.\n"
-        "4. Run /stop to kill active instances."
+        "2. Run /deploy to provision your container.\n"
+        "3. Run /status to check container health.\n"
+        "4. Run /stop to kill active instances.\n"
+        "5. Run /cleanup to sweep orphaned Docker resources."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes uploaded files and isolates them by Telegram User ID."""
-    user_id = str(update.effective_user.id)
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logging.warning(f"Unauthorized upload attempt from user ID: {user_id}")
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
     document = update.message.document
-    
-    user_staging = os.path.join(STAGING_DIR, user_id)
+
+    # Validate file size (100MB max)
+    if document.file_size > MAX_FILE_SIZE:
+        logging.warning(f"User {user_id} attempted to upload a file exceeding limit: {document.file_size} bytes")
+        await update.message.reply_text(
+            f"❌ File too large. Maximum size: 100MB. Your file: {document.file_size / (1024*1024):.1f}MB",
+            parse_mode="Markdown"
+        )
+        return
+
+    str_user_id = str(user_id)
+    user_staging = os.path.join(STAGING_DIR, str_user_id)
+
+    # Clean existing workspace to ensure fresh deployment context
     os.makedirs(user_staging, exist_ok=True)
 
     file_path = os.path.join(user_staging, document.file_name)
     file_obj = await context.bot.get_file(document.file_id)
     await file_obj.download_to_drive(file_path)
 
-    # Extract ZIP packages
-    if document.file_name.endswith('.zip'):
-        with zipfile.ZipFile(file_path, 'r') as zip_ref:
-            zip_ref.extractall(user_staging)
-        os.remove(file_path)
+    logging.info(f"User {user_id} uploaded file '{document.file_name}' ({document.file_size} bytes)")
 
-    # Attach hardened non-root Dockerfile if not explicitly provided
+    # Safely extract ZIP packages
+    if document.file_name.endswith('.zip'):
+        try:
+            safe_extract_zip(file_path, user_staging)
+        except Exception as e:
+            logging.error(f"ZIP extraction failed for user {user_id}: {str(e)}")
+            shutil.rmtree(user_staging, ignore_errors=True)
+            await update.message.reply_text(f"❌ Safe ingestion failed:\n`{str(e)}`", parse_mode="Markdown")
+            return
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+    # ALWAYS force overwrite with hardened Dockerfile template
     dockerfile_target = os.path.join(user_staging, "Dockerfile")
-    if not os.path.exists(dockerfile_target):
-        shutil.copy(os.path.join(TEMPLATES_DIR, "Dockerfile.template"), dockerfile_target)
+    shutil.copy(os.path.join(TEMPLATES_DIR, "Dockerfile.template"), dockerfile_target)
 
     await update.message.reply_text(
-        f"📦 *Code Ingested*\nStaging workspace ready for Telegram ID `{user_id}`.\nRun /deploy to run the container.",
+        f"📦 *Code Ingested Safely*\nStaging workspace ready for Telegram ID `{user_id}`.\nRun /deploy to run the container.",
         parse_mode="Markdown"
     )
 
 async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Builds and runs isolated container with resource hard limits."""
-    user_id = str(update.effective_user.id)
-    user_staging = os.path.join(STAGING_DIR, user_id)
-    container_name = f"dalker_user_{user_id}"
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logging.warning(f"Unauthorized /deploy attempt from user ID: {user_id}")
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
+    str_user_id = str(user_id)
+    
+    # Rate Limiter: 5 seconds between deployments per user
+    current_time = time.time()
+    if str_user_id in user_last_deploy:
+        if current_time - user_last_deploy[str_user_id] < 5:
+            await update.message.reply_text("⏳ Please wait a few seconds before deploying again.")
+            return
+    user_last_deploy[str_user_id] = current_time
+
+    user_staging = os.path.join(STAGING_DIR, str_user_id)
+    container_name = f"dalker_user_{str_user_id}"
 
     if not os.path.exists(user_staging):
         await update.message.reply_text("❌ No code package found. Please upload a `.zip` or `.js` file first.")
+        return
+
+    index_path = os.path.join(user_staging, "index.js")
+    if not os.path.exists(index_path):
+        await update.message.reply_text(
+            "❌ Missing entry point!\nYour workspace must contain an `index.js` file at the root level.",
+            parse_mode="Markdown"
+        )
         return
 
     await update.message.reply_text("⚙️ Building hardened container...")
@@ -137,10 +232,10 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         # Build isolated image
-        image, _ = docker_client.images.build(path=user_staging, tag=f"dalker_img_{user_id}")
+        image, _ = docker_client.images.build(path=user_staging, tag=f"dalker_img_{str_user_id}")
 
         # Enforce private container bridge network per user
-        network_name = f"dalker_net_{user_id}"
+        network_name = f"dalker_net_{str_user_id}"
         try:
             docker_client.networks.get(network_name)
         except docker.errors.NotFound:
@@ -157,6 +252,8 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             restart_policy={"Name": "on-failure", "MaximumRetryCount": 3}
         )
 
+        logging.info(f"Successfully deployed container '{container_name}' (ID: {container.short_id}) for user {user_id}")
+
         await update.message.reply_text(
             f"🚀 *Deployment Successful*\n\n"
             f"• *Container ID:* `{container.short_id}`\n"
@@ -165,13 +262,26 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• *CPU Limit:* `{int(os.getenv('CPU_QUOTA_MICROSECONDS', 50000))/100000 * 100}%`",
             parse_mode="Markdown"
         )
+
+    except docker.errors.BuildError as e:
+        logging.error(f"Build failed for user {user_id}: {str(e)}")
+        await update.message.reply_text("❌ Build failed. Check your Node.js code/dependencies for syntax errors.", parse_mode="Markdown")
+    except docker.errors.DockerException as e:
+        logging.error(f"Docker engine error during deploy for user {user_id}: {str(e)}")
+        await update.message.reply_text("❌ Container engine error. Please notify the administrator.", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Deployment failed:\n`{str(e)}`", parse_mode="Markdown")
+        logging.error(f"Unexpected error during deploy for user {user_id}: {str(e)}")
+        await update.message.reply_text("❌ Deployment failed due to an unexpected error.", parse_mode="Markdown")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Retrieves real-time container health metrics."""
-    user_id = str(update.effective_user.id)
-    container_name = f"dalker_user_{user_id}"
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logging.warning(f"Unauthorized /status attempt from user ID: {user_id}")
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
+    str_user_id = str(user_id)
+    container_name = f"dalker_user_{str_user_id}"
 
     try:
         container = docker_client.containers.get(container_name)
@@ -186,17 +296,43 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔴 No active deployment found associated with your user ID.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stops and removes active container instance."""
-    user_id = str(update.effective_user.id)
-    container_name = f"dalker_user_{user_id}"
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logging.warning(f"Unauthorized /stop attempt from user ID: {user_id}")
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
+    str_user_id = str(user_id)
+    container_name = f"dalker_user_{str_user_id}"
 
     try:
         container = docker_client.containers.get(container_name)
         container.stop()
         container.remove()
+        logging.info(f"Container '{container_name}' stopped and removed by user {user_id}")
         await update.message.reply_text("🛑 Active container stopped and purged.")
     except docker.errors.NotFound:
         await update.message.reply_text("⚠️ No running instance found to stop.")
+
+async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin utility to sweep orphaned images and networks."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logging.warning(f"Unauthorized /cleanup attempt from user ID: {user_id}")
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+    
+    await update.message.reply_text("🧹 Sweeping orphaned Docker resources...")
+    try:
+        pruned_images = docker_client.images.prune(filters={"dangling": True})
+        docker_client.networks.prune()
+        
+        reclaimed_space = pruned_images.get('SpaceReclaimed', 0) / (1024 * 1024)
+        logging.info(f"User {user_id} triggered cleanup. Reclaimed {reclaimed_space:.1f} MB.")
+        await update.message.reply_text(f"✅ Cleanup complete.\nReclaimed {reclaimed_space:.1f} MB of disk space.")
+    except docker.errors.DockerException as e:
+        logging.error(f"Cleanup failed: {str(e)}")
+        await update.message.reply_text("❌ Cleanup encountered a Docker daemon error.")
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
@@ -208,9 +344,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("deploy", deploy))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("cleanup", cleanup))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_ingestion))
 
-    print("🤖 Orchestrator service starting...")
+    logging.info("🤖 Orchestrator service starting...")
     app.run_polling()
 EOF
 
@@ -226,6 +363,6 @@ else
     echo "⚠️ Python3 is not installed. Please install Python3 and pip manually."
 fi
 
-echo -e "\n✨ Setup complete! Make sure Docker is running."
+echo -e "\n✨ Setup complete! Make sure the Docker daemon is running."
 echo "👉 To start the bot, run:"
 echo "cd tg-orkesterator-bot && source venv/bin/activate && python src/bot.py"
