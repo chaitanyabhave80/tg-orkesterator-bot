@@ -9,7 +9,7 @@ if ! command -v docker &>/dev/null; then
     exit 1
 fi
 
-# 1. Create directory hierarchy (vault removed)
+# 1. Create directory hierarchy
 mkdir -p tg-orkesterator-bot/{src,staging,templates}
 cd tg-orkesterator-bot
 
@@ -115,6 +115,7 @@ def safe_extract_zip(zip_file_path: str, extract_to_dir: str):
     target_dir = os.path.abspath(extract_to_dir)
     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
         for member in zip_ref.infolist():
+            # Validate raw member path directly against extraction directory
             member_path = os.path.abspath(os.path.join(target_dir, member.filename))
             if not member_path.startswith(target_dir + os.sep):
                 raise ValueError(f"Security Alert: Path Traversal detected in file: {member.filename}")
@@ -185,7 +186,13 @@ async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Auto-rename single JS uploads so the Dockerfile CMD ["node", "index.js"] works
     elif document.file_name.endswith('.js') and document.file_name != 'index.js':
         target_path = os.path.join(user_staging, "index.js")
-        os.rename(file_path, target_path)
+        shutil.move(file_path, target_path)
+    
+    # Reject unsupported file types
+    elif not document.file_name.endswith('.js'):
+        shutil.rmtree(user_staging, ignore_errors=True)
+        await update.message.reply_text("❌ Unsupported file type. Please upload a `.zip` or `.js` file.")
+        return
 
     # ALWAYS force overwrite with hardened Dockerfile template
     dockerfile_target = os.path.join(user_staging, "Dockerfile")
@@ -216,6 +223,7 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_staging = os.path.join(STAGING_DIR, str_user_id)
     container_name = f"dalker_user_{str_user_id}"
     network_name = f"dalker_net_{str_user_id}"
+    image_tag = f"dalker_img_{str_user_id}"
 
     if not os.path.exists(user_staging):
         await update.message.reply_text("❌ No code package found. Please upload a `.zip` or `.js` file first.")
@@ -236,7 +244,7 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             old = await asyncio.to_thread(docker_client.containers.get, container_name)
             await asyncio.to_thread(old.stop)
-            await asyncio.to_thread(old.remove)
+            await asyncio.to_thread(old.remove, force=True)
         except docker.errors.NotFound:
             pass
 
@@ -244,7 +252,7 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image, _ = await asyncio.to_thread(
             docker_client.images.build,
             path=user_staging,
-            tag=f"dalker_img_{str_user_id}"
+            tag=image_tag
         )
 
         # Enforce private container bridge network per user
@@ -256,7 +264,7 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Deploy container with quotas (Offloaded)
         container = await asyncio.to_thread(
             docker_client.containers.run,
-            image.id,
+            image_tag,
             name=container_name,
             detach=True,
             network=network_name,
@@ -320,10 +328,13 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         container = await asyncio.to_thread(docker_client.containers.get, container_name)
-        raw_logs = await asyncio.to_thread(container.logs, tail=100)  # More lines
+        raw_logs = await asyncio.to_thread(container.logs, tail=100)
         logs_text = raw_logs.decode('utf-8', errors='ignore')
         
-        # If logs are too long, warn user
+        # Sanitize Markdown code block conflicts
+        logs_text = logs_text.replace("```", "'''")
+
+        # Truncate if message exceeds safe limits
         if len(logs_text) > 3500:
             logs_text = "⚠️ Logs truncated (too long):\n\n" + logs_text[-3500:]
         
@@ -347,7 +358,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         container = await asyncio.to_thread(docker_client.containers.get, container_name)
         await asyncio.to_thread(container.stop)
-        await asyncio.to_thread(container.remove)
+        await asyncio.to_thread(container.remove, force=True)
         logging.info(f"Container '{container_name}' stopped and removed by user {user_id}")
         await update.message.reply_text("🛑 Active container stopped and purged.")
     except docker.errors.NotFound:
@@ -365,7 +376,7 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pruned_images = await asyncio.to_thread(docker_client.images.prune, filters={"dangling": True})
         await asyncio.to_thread(docker_client.networks.prune)
         
-        reclaimed_space = pruned_images.get('SpaceReclaimed', 0) / (1024 * 1024)
+        reclaimed_space = (pruned_images or {}).get('SpaceReclaimed', 0) / (1024 * 1024)
         logging.info(f"User {user_id} triggered cleanup. Reclaimed {reclaimed_space:.1f} MB.")
         await update.message.reply_text(f"✅ Cleanup complete.\nReclaimed {reclaimed_space:.1f} MB of disk space.")
     except docker.errors.DockerException as e:
