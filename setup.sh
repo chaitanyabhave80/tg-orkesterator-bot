@@ -1,8 +1,7 @@
-```bash
 #!/bin/bash
 set -e
 
-echo "🚀 Initializing Orchestrator Environment...  devloped by chaitanyabhave80"
+echo "🚀 Initializing Orchestrator Environment... developed by chaitanyabhave80"
 
 # Pre-flight Check: Ensure Docker is installed
 if ! command -v docker &>/dev/null; then
@@ -10,8 +9,8 @@ if ! command -v docker &>/dev/null; then
     exit 1
 fi
 
-# 1. Create directory hierarchy
-mkdir -p tg-orkesterator-bot/{src,staging,vault,templates}
+# 1. Create directory hierarchy (vault removed)
+mkdir -p tg-orkesterator-bot/{src,staging,templates}
 cd tg-orkesterator-bot
 
 # 2. Prompt for config and create environment variable configuration
@@ -30,6 +29,9 @@ CPU_QUOTA_MICROSECONDS=50000
 ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
 EOF
 
+# Lock down .env permissions so other users cannot read the bot token
+chmod 600 .env
+
 # 3. Define project dependencies
 cat << 'EOF' > requirements.txt
 python-telegram-bot>=20.0
@@ -37,10 +39,10 @@ docker>=6.0.0
 python-dotenv>=1.0.0
 EOF
 
-# 4. Create default hardened, non-root Dockerfile template
+# 4. Create default hardened, non-root Dockerfile template (Upgraded to node:22-alpine)
 cat << 'EOF' > templates/Dockerfile.template
 # Hardened Base Container
-FROM node:18-alpine
+FROM node:22-alpine
 
 # Create non-root user and set permissions
 RUN addgroup -S dalkergroup && adduser -S dalkeruser -G dalkergroup
@@ -97,7 +99,6 @@ if not ALLOWED_USER_IDS:
     )
 
 STAGING_DIR = os.path.abspath("./staging")
-VAULT_DIR = os.path.abspath("./vault")
 TEMPLATES_DIR = os.path.abspath("./templates")
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB limit
@@ -132,8 +133,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Send a `.zip` or `.js` file to stage your deployment.\n"
         "2. Run /deploy to provision your container.\n"
         "3. Run /status to check container health.\n"
-        "4. Run /stop to kill active instances.\n"
-        "5. Run /cleanup to sweep orphaned Docker resources."
+        "4. Run /logs to inspect application output.\n"
+        "5. Run /stop to kill active instances.\n"
+        "6. Run /cleanup to sweep orphaned Docker resources."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -306,6 +308,32 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except docker.errors.NotFound:
         await update.message.reply_text("🔴 No active deployment found associated with your user ID.")
 
+async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        logging.warning(f"Unauthorized /logs attempt from user ID: {user_id}")
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
+    str_user_id = str(user_id)
+    container_name = f"dalker_user_{str_user_id}"
+
+    try:
+        container = await asyncio.to_thread(docker_client.containers.get, container_name)
+        raw_logs = await asyncio.to_thread(container.logs, tail=100)  # More lines
+        logs_text = raw_logs.decode('utf-8', errors='ignore')
+        
+        # If logs are too long, warn user
+        if len(logs_text) > 3500:
+            logs_text = "⚠️ Logs truncated (too long):\n\n" + logs_text[-3500:]
+        
+        await update.message.reply_text(
+            f"📜 *Container Logs:*\n```\n{logs_text if logs_text else '(no output yet)'}\n```",
+            parse_mode="Markdown"
+        )
+    except docker.errors.NotFound:
+        await update.message.reply_text("🔴 No active deployment found to fetch logs from.")
+
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_authorized(user_id):
@@ -353,6 +381,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("deploy", deploy))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("logs", logs_cmd))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("cleanup", cleanup))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_ingestion))
@@ -376,5 +405,3 @@ fi
 echo -e "\n✨ Setup complete! Make sure the Docker daemon is running."
 echo "👉 To start the bot, run:"
 echo "cd tg-orkesterator-bot && source venv/bin/activate && python src/bot.py"
-
-```
