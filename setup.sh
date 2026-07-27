@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Initializing Orchestrator Environment... developed by chaitanyabhave80"
+echo "🚀 Initializing Orchestrator Environment...BY chaitanyabhave80"
 
 # Pre-flight Check: Ensure Docker is installed
 if ! command -v docker &>/dev/null; then
@@ -39,24 +39,28 @@ docker>=6.0.0
 python-dotenv>=1.0.0
 EOF
 
-# 4. Create default hardened, non-root Dockerfile template (Upgraded to node:22-alpine)
+# 4. Create default hardened, non-root Dockerfile template with npm install support
 cat << 'EOF' > templates/Dockerfile.template
-# Hardened Base Container
 FROM node:22-alpine
 
-# Create non-root user and set permissions
-RUN addgroup -S dalkergroup && adduser -S dalkeruser -G dalkergroup
 WORKDIR /app
-COPY . .
-RUN chown -R dalkeruser:dalkergroup /app
 
-# Drop root permissions
+# Copy only necessary files (exclude .env, staging, etc.)
+COPY package*.json ./
+RUN if [ -f package.json ]; then npm install --omit=dev; fi
+
+COPY . .
+
+# Create non-root user and assign permissions
+RUN addgroup -S dalkergroup && adduser -S dalkeruser -G dalkergroup && \
+    chown -R dalkeruser:dalkergroup /app
+
 USER dalkeruser
 
 CMD ["node", "index.js"]
 EOF
 
-# 5. Generate secure Python Orchestrator logic
+# 5. Generate secure Python Orchestrator logic (with fixes)
 cat << 'EOF' > src/bot.py
 import os
 import shutil
@@ -65,6 +69,7 @@ import logging
 import docker
 import time
 import asyncio
+import html
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -85,10 +90,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Fail fast at startup if ALLOWED_USER_IDS is missing or invalid
 ALLOWED_USER_IDS = [
-    int(uid.strip()) 
-    for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") 
+    int(uid.strip())
+    for uid in os.getenv("ALLOWED_USER_IDS", "").split(",")
     if uid.strip().isdigit()
 ]
 
@@ -111,15 +115,54 @@ def is_authorized(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 def safe_extract_zip(zip_file_path: str, extract_to_dir: str):
-    """Prevents Zip Slip (path traversal) vulnerabilities during extraction."""
+    """Prevents Zip Slip and Symlink attacks."""
     target_dir = os.path.abspath(extract_to_dir)
     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
         for member in zip_ref.infolist():
-            # Validate raw member path directly against extraction directory
+            # Resolve the full path
             member_path = os.path.abspath(os.path.join(target_dir, member.filename))
-            if not member_path.startswith(target_dir + os.sep):
+            # Check path traversal
+            if not (member_path == target_dir or member_path.startswith(target_dir + os.sep)):
                 raise ValueError(f"Security Alert: Path Traversal detected in file: {member.filename}")
+
+            # Check symlink – use is_symlink() if available, else fallback
+            try:
+                if member.is_symlink():
+                    raise ValueError(f"Security Alert: Symlink detected in file: {member.filename}")
+            except AttributeError:
+                # Fallback for older Python versions
+                import stat
+                if stat.S_ISLNK(member.external_attr >> 16):
+                    raise ValueError(f"Security Alert: Symlink detected in file: {member.filename}")
+
         zip_ref.extractall(target_dir)
+
+def normalize_workspace(user_staging: str):
+    """
+    Flattens a single nested folder archive if index.js is inside a root folder.
+    Also ensures that any stray Dockerfile is removed (we provide our own).
+    """
+    # Remove any existing Dockerfile that might have been in the zip
+    dockerfile_path = os.path.join(user_staging, "Dockerfile")
+    if os.path.exists(dockerfile_path):
+        os.remove(dockerfile_path)
+
+    if os.path.exists(os.path.join(user_staging, "index.js")):
+        return
+
+    subdirs = [
+        os.path.join(user_staging, d)
+        for d in os.listdir(user_staging)
+        if os.path.isdir(os.path.join(user_staging, d))
+    ]
+
+    # If ZIP extracted into a single wrapper folder, pull contents up
+    if len(subdirs) == 1:
+        nested_dir = subdirs[0]
+        if os.path.exists(os.path.join(nested_dir, "index.js")):
+            for item in os.listdir(nested_dir):
+                shutil.move(os.path.join(nested_dir, item), user_staging)
+            os.rmdir(nested_dir)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -160,7 +203,7 @@ async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     str_user_id = str(user_id)
     user_staging = os.path.join(STAGING_DIR, str_user_id)
 
-    # Clean existing workspace to ensure fresh deployment context
+    # Clean existing workspace
     shutil.rmtree(user_staging, ignore_errors=True)
     os.makedirs(user_staging, exist_ok=True)
 
@@ -170,10 +213,10 @@ async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logging.info(f"User {user_id} uploaded file '{document.file_name}' ({document.file_size} bytes)")
 
-    # Safely extract ZIP packages (Offloaded to worker thread)
     if document.file_name.endswith('.zip'):
         try:
             await asyncio.to_thread(safe_extract_zip, file_path, user_staging)
+            normalize_workspace(user_staging)
         except Exception as e:
             logging.error(f"ZIP extraction failed for user {user_id}: {str(e)}")
             shutil.rmtree(user_staging, ignore_errors=True)
@@ -182,19 +225,19 @@ async def handle_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             if os.path.exists(file_path):
                 os.remove(file_path)
-    
-    # Auto-rename single JS uploads so the Dockerfile CMD ["node", "index.js"] works
+
     elif document.file_name.endswith('.js') and document.file_name != 'index.js':
         target_path = os.path.join(user_staging, "index.js")
         shutil.move(file_path, target_path)
-    
-    # Reject unsupported file types
-    elif not document.file_name.endswith('.js'):
+    elif document.file_name == 'index.js':
+        # Already in place
+        pass
+    else:
         shutil.rmtree(user_staging, ignore_errors=True)
         await update.message.reply_text("❌ Unsupported file type. Please upload a `.zip` or `.js` file.")
         return
 
-    # ALWAYS force overwrite with hardened Dockerfile template
+    # Force overwrite Dockerfile with hardened template
     dockerfile_target = os.path.join(user_staging, "Dockerfile")
     shutil.copy(os.path.join(TEMPLATES_DIR, "Dockerfile.template"), dockerfile_target)
 
@@ -211,8 +254,8 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     str_user_id = str(user_id)
-    
-    # Rate Limiter: 5 seconds between deployments
+
+    # Rate Limiter: 5 seconds
     current_time = time.time()
     if str_user_id in user_last_deploy:
         if current_time - user_last_deploy[str_user_id] < 5:
@@ -237,10 +280,10 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("⚙️ Building hardened container... This may take a moment.")
+    await update.message.reply_text("⚙️ Building hardened container... This may take up to 5 minutes.")
 
     try:
-        # Cleanup existing running container instance (Offloaded)
+        # Cleanup existing running container instance
         try:
             old = await asyncio.to_thread(docker_client.containers.get, container_name)
             await asyncio.to_thread(old.stop)
@@ -248,20 +291,28 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except docker.errors.NotFound:
             pass
 
-        # Build isolated image (Offloaded to prevent blocking Event Loop)
-        image, _ = await asyncio.to_thread(
-            docker_client.images.build,
-            path=user_staging,
-            tag=image_tag
-        )
+        # Build isolated image with a hard timeout to prevent npm install hangs
+        try:
+            image, _ = await asyncio.wait_for(
+                asyncio.to_thread(
+                    docker_client.images.build,
+                    path=user_staging,
+                    tag=image_tag,
+                    rm=True  # remove intermediate containers
+                ),
+                timeout=300
+            )
+        except asyncio.TimeoutError:
+            await update.message.reply_text("❌ Build timed out. Ensure your dependencies install cleanly.", parse_mode="Markdown")
+            return
 
-        # Enforce private container bridge network per user
+        # Enforce private container bridge network per user, restricted from the host internal networks
         try:
             await asyncio.to_thread(docker_client.networks.get, network_name)
         except docker.errors.NotFound:
-            await asyncio.to_thread(docker_client.networks.create, network_name, driver="bridge")
+            await asyncio.to_thread(docker_client.networks.create, network_name, driver="bridge", internal=True)
 
-        # Deploy container with quotas (Offloaded)
+        # Deploy container with quotas
         container = await asyncio.to_thread(
             docker_client.containers.run,
             image_tag,
@@ -278,7 +329,7 @@ async def deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🚀 *Deployment Successful*\n\n"
             f"• *Container ID:* `{container.short_id}`\n"
-            f"• *Network:* `{network_name}`\n"
+            f"• *Network:* `{network_name}` (Internal)\n"
             f"• *Memory Cap:* `{os.getenv('MAX_MEMORY_LIMIT', '256m')}`\n"
             f"• *CPU Limit:* `{int(os.getenv('CPU_QUOTA_MICROSECONDS', 50000))/100000 * 100}%`",
             parse_mode="Markdown"
@@ -329,18 +380,16 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         container = await asyncio.to_thread(docker_client.containers.get, container_name)
         raw_logs = await asyncio.to_thread(container.logs, tail=100)
-        logs_text = raw_logs.decode('utf-8', errors='ignore')
-        
-        # Sanitize Markdown code block conflicts
-        logs_text = logs_text.replace("```", "'''")
 
-        # Truncate if message exceeds safe limits
+        # Parse mode HTML to avoid breaking Markdown rendering via unescaped special characters
+        logs_text = html.escape(raw_logs.decode('utf-8', errors='ignore'))
+
         if len(logs_text) > 3500:
             logs_text = "⚠️ Logs truncated (too long):\n\n" + logs_text[-3500:]
-        
+
         await update.message.reply_text(
-            f"📜 *Container Logs:*\n```\n{logs_text if logs_text else '(no output yet)'}\n```",
-            parse_mode="Markdown"
+            f"<b>📜 Container Logs:</b>\n<pre>{logs_text if logs_text else '(no output yet)'}</pre>",
+            parse_mode="HTML"
         )
     except docker.errors.NotFound:
         await update.message.reply_text("🔴 No active deployment found to fetch logs from.")
@@ -370,12 +419,12 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.warning(f"Unauthorized /cleanup attempt from user ID: {user_id}")
         await update.message.reply_text("⛔ Unauthorized access.")
         return
-    
+
     await update.message.reply_text("🧹 Sweeping orphaned Docker resources...")
     try:
         pruned_images = await asyncio.to_thread(docker_client.images.prune, filters={"dangling": True})
         await asyncio.to_thread(docker_client.networks.prune)
-        
+
         reclaimed_space = (pruned_images or {}).get('SpaceReclaimed', 0) / (1024 * 1024)
         logging.info(f"User {user_id} triggered cleanup. Reclaimed {reclaimed_space:.1f} MB.")
         await update.message.reply_text(f"✅ Cleanup complete.\nReclaimed {reclaimed_space:.1f} MB of disk space.")
@@ -411,8 +460,9 @@ if command -v python3 &>/dev/null; then
     echo "✅ Dependencies installed successfully."
 else
     echo "⚠️ Python3 is not installed. Please install Python3 and pip manually."
+    exit 1
 fi
 
 echo -e "\n✨ Setup complete! Make sure the Docker daemon is running."
 echo "👉 To start the bot, run:"
-echo "cd tg-orkesterator-bot && source venv/bin/activate && python src/bot.py"
+echo "source venv/bin/activate && python src/bot.py"
